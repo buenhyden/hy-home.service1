@@ -1,0 +1,97 @@
+name: CI-CD - Build, Push, and Kustomize Update
+
+on:
+    push:
+        branches: ["main"]
+
+jobs:
+    # ---------------------------------
+    # CI: 빌드, 테스트, 이미지 푸시
+    # ---------------------------------
+    build-and-push-image:
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+            packages: write # GHCR에 푸시할 권한
+
+        outputs:
+            # Git SHA를 태그로 사용 (예: a4b2c1d)
+            image-tag: ${{ steps.meta.outputs.version }}
+
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0 # Git 태그/해시를 읽기 위해 필요
+
+            - name: Log in to GHCR
+              uses: docker/login-action@v3
+              with:
+                  registry: ghcr.io
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Docker meta (Generate tags)
+              id: meta
+              uses: docker/metadata-action@v5
+              with:
+                  images: ghcr.io/${{ github.repository }}
+                  tags: |
+                      # Git 커밋 해시 (짧은 버전)
+                      type=sha,prefix=,format=short 
+                      type=raw,value=latest
+
+            - name: Build and push
+              uses: docker/build-push-action@v5
+              with:
+                  context: .
+                  push: true
+                  tags: ${{ steps.meta.outputs.tags }}
+                  labels: ${{ steps.meta.outputs.labels }}
+
+    # -----------------------------------------------------
+    # CD: GitOps 리포(hy-home-infra)의 kustomization.yaml 업데이트
+    # -----------------------------------------------------
+    update-gitops-manifest:
+        runs-on: ubuntu-latest
+        needs: build-and-push-image # 'build-and-push-image' Job이 성공해야 실행
+
+        steps:
+            - name: Checkout GitOps repo (hy-home-infra)
+              uses: actions/checkout@v4
+              with:
+                  # [중요] 'hy-home-infra' 리포지토리
+                  repository: ${{ github.repository_owner }}/hy-home-infra
+                  # [중요] 0단계에서 설정한 PAT (GH_PAT) 사용
+                  token: ${{ secrets.GH_PAT }}
+
+            - name: Setup Kustomize
+              uses: imranismail/setup-kustomize@v2
+
+            - name: Update image tag using Kustomize
+              run: |
+                  # 1. 새 이미지 태그 (Git SHA)
+                  NEW_TAG="${{ needs.build-and-push-image.outputs.image-tag }}"
+                  IMAGE_NAME="ghcr.io/${{ github.repository }}"
+
+                  echo "Updating image to: $IMAGE_NAME:$NEW_TAG"
+
+                  # 2. Kustomize가 작업할 디렉토리로 이동
+                  cd k8s/hy-home-api/overlays/production
+
+                  # 3. [핵심] kustomize edit 명령어로 kustomization.yaml을 안전하게 수정
+                  # 'sed'와 달리, 파일 구조를 이해하고 정확하게 이미지만 교체
+                  kustomize edit set image $IMAGE_NAME=$IMAGE_NAME:$NEW_TAG
+
+            - name: Commit and push changes
+              run: |
+                  git config --global user.name "GitHub Actions Bot"
+                  git config --global user.email "actions-bot@github.com"
+
+                  # 변경된 kustomization.yaml 파일 추가
+                  git add k8s/hy-home-api/overlays/production/kustomization.yaml
+
+                  # 변경 사항이 있을 때만 커밋
+                  git diff --staged --quiet || git commit -m "Update image tag for hy-home-api to ${{ needs.build-and-push-image.outputs.image-tag }}"
+
+                  git push
